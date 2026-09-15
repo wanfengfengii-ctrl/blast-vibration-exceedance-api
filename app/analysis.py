@@ -55,6 +55,18 @@ class Point:
     vibration: float
 
 
+# 整数秒纪元的基准：对齐配对改用整数秒做键。
+# datetime 边界（9999 年末 / 0001 年初）附近做 p.ts ± lag 平移会溢出
+# （OverflowError -> 500）；datetime 减法永不溢出，整数加减亦永不溢出。
+_EPOCH = datetime(1970, 1, 1)
+
+
+def _epoch_seconds(ts: datetime) -> int:
+    """自 1970-01-01 起的整数秒（时间戳已校验精确到秒，纯整数运算）。"""
+    delta = ts - _EPOCH
+    return delta.days * 86400 + delta.seconds
+
+
 def _to_points(samples) -> list[Point]:
     points = [
         Point(datetime.strptime(s.timestamp, TS_FORMAT), s.timestamp, s.vibration)
@@ -198,15 +210,14 @@ def align_series(points: list[Point], ref_points: list[Point]) -> Alignment:
     舍入后比较，最高者胜出；同分依次取 |lag| 较小、数值较小的时移。
     无任何合格候选时抛 AlignmentError（unalignable_series）。
     """
-    ref_by_ts = {p.ts: p.vibration for p in ref_points}
+    ref_by_ts = {_epoch_seconds(p.ts): p.vibration for p in ref_points}
     shorter = min(len(points), len(ref_points))
     best: tuple[Decimal, int, int] | None = None  # (correlation, lag, paired)
     for lag in range(-MAX_LAG_SECONDS, MAX_LAG_SECONDS + 1):
-        shift = timedelta(seconds=lag)
         pairs = [
-            (p.vibration, ref_by_ts[p.ts - shift])
+            (p.vibration, ref_by_ts[key])
             for p in points
-            if p.ts - shift in ref_by_ts
+            if (key := _epoch_seconds(p.ts) - lag) in ref_by_ts
         ]
         paired = len(pairs)
         if paired < MIN_PAIRED_SAMPLES:

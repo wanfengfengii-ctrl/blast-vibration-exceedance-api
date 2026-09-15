@@ -701,3 +701,68 @@ def test_reference_empty_batch_rejected(post):
     payload = seq([1.0])
     payload["reference_samples"] = []
     assert post(payload).status_code == 422
+
+
+# ---------- datetime 边界（9999 年末 / 0001 年初） ----------
+
+def seq_at(values, base: datetime, start: int = 0) -> list:
+    """从 base + start 秒起按秒生成采样；isoformat 保证年份始终零填充。"""
+    return [
+        {
+            "timestamp": (base + timedelta(seconds=start + i)).isoformat() + "Z",
+            "vibration": float(v),
+        }
+        for i, v in enumerate(values)
+    ]
+
+
+def test_alignment_near_datetime_max(post):
+    # 9999 年末：lag 为负时参考键换算不得溢出 datetime 上限（曾 500）
+    end = datetime(9999, 12, 31, 23, 59, 50)  # 10 个采样正好到 23:59:59
+    payload = {
+        "samples": seq_at(WAVE, end),
+        "reference_samples": seq_at(WAVE, end, start=-3),  # 早 3 秒
+    }
+    resp = post(payload)
+    assert resp.status_code == 200
+    alignment = resp.json()["alignment"]
+    assert alignment["lag_seconds"] == 3
+    assert alignment["correlation"] == 1.0
+    assert alignment["paired_sample_count"] == 10
+
+
+def test_alignment_near_datetime_min(post):
+    # 0001 年初：lag 为正时参考键换算不得溢出 datetime 下限（曾 500）
+    start = datetime(1, 1, 1, 0, 0, 0)
+    payload = {
+        "samples": seq_at(WAVE, start),
+        "reference_samples": seq_at(WAVE, start, start=2),  # 晚 2 秒
+    }
+    resp = post(payload)
+    assert resp.status_code == 200
+    alignment = resp.json()["alignment"]
+    assert alignment["lag_seconds"] == -2
+    assert alignment["correlation"] == 1.0
+    assert alignment["paired_sample_count"] == 10
+
+
+def test_event_at_year_one_timestamps_zero_padded(post):
+    # 0001 年的时间戳规范化后仍为 4 位零填充，事件识别与输出正常
+    resp = post({"samples": seq_at([5.00, 8.00, 5.00], datetime(1, 1, 1))})
+    assert resp.status_code == 200
+    event = resp.json()["events"][0]
+    assert event["start"] == "0001-01-01T00:00:00Z"
+    assert event["end"] == "0001-01-01T00:00:02Z"
+    assert event["duration_seconds"] == 3
+
+
+def test_unalignable_near_datetime_max_returns_422_not_500(post):
+    # 边界附近不可对齐时仍走正常 422，而非服务器错误
+    end = datetime(9999, 12, 31, 23, 59, 50)
+    payload = {
+        "samples": seq_at(WAVE, end),
+        "reference_samples": seq_at(WAVE, datetime(9999, 12, 30, 0, 0, 0)),
+    }
+    resp = post(payload)
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "unalignable_series"

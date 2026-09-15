@@ -55,8 +55,12 @@ class Sample(BaseModel):
         # 精确到秒：不允许出现秒以下的小数秒
         if parsed.microsecond != 0:
             raise ValueError("时间戳必须精确到秒")
-        # 规范化为零填充标准形式，保证输出时间戳格式统一
-        return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # 规范化为零填充标准形式，保证输出时间戳格式统一。
+        # 用 isoformat 而非 strftime：部分平台（如 glibc）的 strftime
+        # 对 1000 年以前的年份不零填充（"1-01-01"），会导致后续
+        # strptime("%Y") 往返解析失败；isoformat 始终输出 4 位年份。
+        # 已校验精确到秒，isoformat 不会带出小数秒。
+        return parsed.isoformat() + "Z"
 
     @field_validator("vibration")
     @classmethod
