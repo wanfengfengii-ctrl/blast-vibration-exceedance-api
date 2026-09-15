@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from .models import (
     MERGE_GAP,
@@ -12,6 +13,11 @@ from .models import (
 )
 
 TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+# 累计超限量用十进制定点运算：阈值、零与两位小数精度
+_DEC_THRESHOLD = Decimal("5.00")
+_DEC_ZERO = Decimal("0")
+_DEC_CENT = Decimal("0.01")
 
 
 class BatchValidationError(ValueError):
@@ -59,7 +65,22 @@ def validate_series(points: list[Point]) -> None:
             )
 
 
-def detect_events(points: list[Point]) -> list[Event]:
+def _excess_dose_mm(points: list[Point], start_i: int, end_i: int) -> float:
+    """累计超限量：从事件首个超限采样到末个超限采样，逐秒累加
+    max(振速 − 5.00, 0) × 1 秒。
+
+    合并区段中夹着的低值采样经 max(·, 0) 后贡献为零；全程十进制定点
+    运算并保留两位小数，避免浮点累计漂移（如 0.10+0.20+0.30）。
+    """
+    total = _DEC_ZERO
+    for k in range(start_i, end_i + 1):
+        # 振速已校验至多两位小数，格式化为两位即得精确十进制值
+        vibration = Decimal(f"{points[k].vibration:.2f}")
+        total += max(vibration - _DEC_THRESHOLD, _DEC_ZERO)  # × 1 秒
+    return float(total.quantize(_DEC_CENT))
+
+
+def detect_events(points: list[Point], include_exposure: bool = False) -> list[Event]:
     """识别持续超限事件。
 
     1. 取振速 >= 5.00 的最大连续区段，仅保留长度 >= 3 的合格区段；
@@ -115,15 +136,20 @@ def detect_events(points: list[Point]) -> list[Event]:
                 duration_seconds=duration_seconds,
                 peak_vibration=peak.vibration,
                 peak_timestamp=peak.timestamp,
+                excess_dose_mm=(
+                    _excess_dose_mm(points, start_i, end_i)
+                    if include_exposure
+                    else None
+                ),
             )
         )
     return events
 
 
-def analyze(samples) -> AnalyzeResponse:
+def analyze(samples, include_exposure: bool = False) -> AnalyzeResponse:
     points = _to_points(samples)
     validate_series(points)
-    events = detect_events(points)
+    events = detect_events(points, include_exposure=include_exposure)
     return AnalyzeResponse(
         conclusion="复核" if events else "放行",
         event_count=len(events),

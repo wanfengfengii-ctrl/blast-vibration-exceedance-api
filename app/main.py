@@ -89,11 +89,17 @@ async def health() -> dict[str, str]:
 router = APIRouter(route_class=StrictJsonRoute)
 
 
-@router.post("/api/v1/analyze", response_model=AnalyzeResponse)
+@router.post(
+    "/api/v1/analyze",
+    response_model=AnalyzeResponse,
+    # include_exposure 缺省 / false 时 excess_dose_mm 为 None，
+    # 序列化时剔除，保持原有响应结构不变
+    response_model_exclude_none=True,
+)
 async def analyze_samples(payload: AnalyzeRequest) -> AnalyzeResponse:
     # 字段结构 / 单条采样取值问题由 FastAPI/Pydantic 直接返回 422；
     # 重复时间戳、间隔不为 1 秒等整批级错误由 BatchValidationError 转 422。
-    return analyze(payload.samples)
+    return analyze(payload.samples, include_exposure=payload.include_exposure)
 
 
 app.include_router(router)

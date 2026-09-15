@@ -322,3 +322,106 @@ def test_wrong_field_types_rejected(post):
     # 时间戳必须是字符串
     resp = post({"samples": [{"timestamp": 1757930400, "vibration": 5.0}]})
     assert resp.status_code == 422
+
+
+# ---------- 累计超限量 include_exposure ----------
+
+def test_exposure_omitted_by_default_matches_legacy_contract(post):
+    resp = post(seq([6.00, 7.00, 5.00]))
+    assert resp.status_code == 200
+    body = resp.json()
+    # 顶层结构与事件字段均与旧契约一致，不出现 excess_dose_mm
+    assert set(body) == {"conclusion", "event_count", "events"}
+    event = body["events"][0]
+    assert set(event) == {
+        "start", "end", "duration_seconds", "peak_vibration", "peak_timestamp",
+    }
+
+
+def test_exposure_omitted_when_flag_is_false(post):
+    payload = seq([6.00, 7.00, 5.00])
+    payload["include_exposure"] = False
+    event = post(payload).json()["events"][0]
+    assert "excess_dose_mm" not in event
+
+
+def test_exposure_accumulates_over_continuous_event(post):
+    # (0.10 + 1.20 + 2.30 + 0.00) × 1 秒 = 3.60
+    payload = seq([5.10, 6.20, 7.30, 5.00])
+    payload["include_exposure"] = True
+    event = post(payload).json()["events"][0]
+    assert event["excess_dose_mm"] == 3.6
+
+
+def test_exposure_no_float_accumulation_drift(post):
+    # 浮点累加 0.10+0.20+0.30 会得到 0.5999999999999996，定点运算必须为 0.60
+    payload = seq([5.10, 5.20, 5.30])
+    payload["include_exposure"] = True
+    assert post(payload).json()["events"][0]["excess_dose_mm"] == 0.6
+
+
+def test_exposure_merged_event_with_one_low_gap_counts_only_overlimit(post):
+    # 1 个低值间隔的合并事件：低值采样贡献为零，1.00×3 + 2.00×3 = 9.00
+    payload = seq([6.00, 6.00, 6.00, 4.99, 7.00, 7.00, 7.00])
+    payload["include_exposure"] = True
+    body = post(payload).json()
+    assert body["event_count"] == 1
+    assert body["events"][0]["excess_dose_mm"] == 9.0
+
+
+def test_exposure_merged_event_with_two_low_gaps_counts_only_overlimit(post):
+    # 2 个低值间隔的合并事件：同样只累计超限采样
+    payload = seq([6.00, 6.00, 6.00, 1.00, 1.00, 7.00, 7.00, 7.00])
+    payload["include_exposure"] = True
+    body = post(payload).json()
+    assert body["event_count"] == 1
+    assert body["events"][0]["excess_dose_mm"] == 9.0
+
+
+def test_exposure_present_for_every_event_when_enabled(post):
+    payload = seq([5.50, 5.50, 5.50, 1.00, 1.00, 1.00, 6.00, 6.00, 6.00])
+    payload["include_exposure"] = True
+    events = post(payload).json()["events"]
+    assert len(events) == 2
+    assert [e["excess_dose_mm"] for e in events] == [1.5, 3.0]
+
+
+def test_exposure_with_unsorted_samples(post):
+    # 乱序重排后累计：0.00 + 3.00 + 0.00 = 3.00
+    payload = seq([5.00, 8.00, 5.00, 1.00, 1.00], shuffled=True)
+    payload["include_exposure"] = True
+    event = post(payload).json()["events"][0]
+    assert event["start"] == ts_at(0)
+    assert event["end"] == ts_at(2)
+    assert event["excess_dose_mm"] == 3.0
+
+
+def test_exposure_flag_does_not_change_existing_fields(post):
+    base = seq([6.00, 6.00, 6.00, 4.99, 7.00, 7.00, 7.00])
+    legacy = post(base).json()
+    exposed = post(dict(base, include_exposure=True)).json()
+    assert legacy["conclusion"] == exposed["conclusion"]
+    assert legacy["event_count"] == exposed["event_count"]
+    for old, new in zip(legacy["events"], exposed["events"]):
+        for key in ("start", "end", "duration_seconds",
+                    "peak_vibration", "peak_timestamp"):
+            assert old[key] == new[key]
+
+
+def test_exposure_with_no_events_keeps_release_conclusion(post):
+    payload = seq([1.00, 2.00, 4.99])
+    payload["include_exposure"] = True
+    body = post(payload).json()
+    assert body == {"conclusion": "放行", "event_count": 0, "events": []}
+
+
+def test_non_boolean_exposure_flag_rejected_batch(post):
+    # 开关类型错误按现有请求校验整批拒绝，不产生事件结果
+    for bad in ("true", "false", 1, 0):
+        payload = seq([6.00, 6.00, 6.00])  # 本可产生事件
+        payload["include_exposure"] = bad
+        resp = post(payload)
+        assert resp.status_code == 422, bad
+        body = resp.json()
+        assert "events" not in body
+        assert "conclusion" not in body

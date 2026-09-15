@@ -3,7 +3,15 @@
 import re
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictStr,
+    field_validator,
+)
 
 # 带 Z、精确到秒的 RFC3339（date-time 主体部分，零填充）
 _TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
@@ -67,6 +75,10 @@ class AnalyzeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     samples: list[Sample] = Field(..., min_length=1)
+    include_exposure: StrictBool = Field(
+        False,
+        description="为 true 时每个事件附带累计超限量 excess_dose_mm；省略或 false 时响应结构不变",
+    )
 
 
 class Event(BaseModel):
@@ -77,6 +89,8 @@ class Event(BaseModel):
     duration_seconds: int
     peak_vibration: float
     peak_timestamp: str
+    # 仅在请求 include_exposure=true 时填充；为 None 时响应中不输出该字段
+    excess_dose_mm: float | None = None
 
 
 class AnalyzeResponse(BaseModel):
