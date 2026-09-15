@@ -248,14 +248,26 @@ def test_value_range_boundaries(post):
     assert post(seq([200.01])).status_code == 422
 
 
-def test_more_than_two_decimals_rejected(post):
+def test_more_than_two_decimals_rejected(post, post_raw):
     # 5.005 数值在范围内，但超过两位小数
     assert post(seq([5.005])).status_code == 422
-    # 字符串形式同样拒绝
-    resp = post(
-        {"samples": [{"timestamp": ts_at(0), "vibration": 5.001}]}
-    )
-    assert resp.status_code == 422
+    # 词法层面的三位小数：解析成 float 后与 5.0 无区别，必须在 JSON 层拦截
+    assert post_raw('{"samples":[{"timestamp":"%s","vibration":5.000}]}' % ts_at(0)).status_code == 422
+    # 科学计数法同样不允许（5e0 数值等于 5.0）
+    assert post_raw('{"samples":[{"timestamp":"%s","vibration":5e0}]}' % ts_at(0)).status_code == 422
+    assert post_raw('{"samples":[{"timestamp":"%s","vibration":1.2E1}]}' % ts_at(0)).status_code == 422
+
+
+def test_plain_number_forms_accepted(post, post_raw):
+    # 整数、一位/两位小数均合法
+    assert post(seq([5])).status_code == 200
+    assert post(seq([5.0])).status_code == 200
+    assert post(seq([5.00])).status_code == 200
+    assert post_raw('{"samples":[{"timestamp":"%s","vibration":200}]}' % ts_at(0)).status_code == 200
+
+
+def test_malformed_json_rejected(post_raw):
+    assert post_raw("{not json").status_code == 422
 
 
 @pytest.mark.parametrize(

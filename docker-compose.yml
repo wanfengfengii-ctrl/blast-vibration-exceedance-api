@@ -16,11 +16,11 @@ services:
       retries: 10
       start_period: 3s
 
-  # 一次性验收服务：对运行中的 API 容器跑全部 pytest，结束即退出。
+  # 一次性验收服务：复用 api 已构建的镜像（不重复构建、不另打 tag），
+  # 等待 api 健康后在容器网络内对其跑全部 pytest，结束即退出。
   # 用法：docker compose --profile verify run --rm verify
   verify:
     profiles: ["verify"]
-    build: .
     image: blast-vibration-api:local
     depends_on:
       api:

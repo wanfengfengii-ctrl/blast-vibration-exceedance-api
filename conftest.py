@@ -34,6 +34,22 @@ def post(client):
 
 
 @pytest.fixture
+def post_raw(client):
+    """直接发送原始 JSON 文本，用于检验词法层面的数字格式。"""
+    base_url = os.environ.get("BASE_URL")
+    headers = {"content-type": "application/json"}
+
+    def _post_raw(raw: str):
+        if base_url:
+            return httpx.post(
+                f"{base_url}/api/v1/analyze", content=raw, headers=headers, timeout=10
+            )
+        return client.post("/api/v1/analyze", content=raw, headers=headers)
+
+    return _post_raw
+
+
+@pytest.fixture
 def get(client):
     base_url = os.environ.get("BASE_URL")
 

@@ -14,8 +14,11 @@
 
 - `timestamp`：必须是以 `Z` 结尾、**精确到秒**的 RFC3339，如 `2026-09-15T10:00:00Z`；
   不接受 `+00:00` 等偏移写法，不接受小数秒；
-- `vibration`：单位 **mm/s**，有限数值，**至多两位小数**，范围 `0.00 ~ 200.00`
-  （`NaN` / `Infinity` / `-Infinity` 一律拒绝）；
+- `vibration`：单位 **mm/s**，有限数值，范围 `0.00 ~ 200.00`
+  （`NaN` / `Infinity` / `-Infinity` 一律拒绝）；数字必须使用普通十进制写法，
+  **小数位至多 2 位、不得使用科学计数法**——校验按 JSON 原始字面量执行，
+  因此 `5.000`、`5.005`、`5e0`、`1.2E1` 即使数值落在范围内也会被拒绝，
+  `5`、`5.0`、`5.00`、`200.00` 均合法；
 - 重排后时间戳**不得重复**；
 - 重排后**相邻采样间隔必须恰为 1 秒**。
 
@@ -83,8 +86,10 @@
 { "detail": "时间戳重复：2026-09-15T10:00:01Z", "code": "duplicate_timestamp" }
 ```
 
-其他整批级错误码：`non_second_interval`（相邻间隔不为 1 秒）、
-`invalid_request`（字段缺失、时间戳格式、数值非有限 / 越界 / 小数位超限等）。
+其他错误码：`non_second_interval`（相邻间隔不为 1 秒）、
+`invalid_number_format`（数字写法不合法：超过两位小数、科学计数法、NaN/Infinity）、
+`invalid_json`（请求体不是合法 JSON）、
+`invalid_request`（字段缺失、时间戳格式、数值越界、类型不符等）。
 
 另有 `GET /health` 存活探针，返回 `{"status":"ok"}`。服务启动后可访问
 `/docs` 查看交互式接口文档。
@@ -118,7 +123,9 @@ API_PORT=9000 docker compose up --build
 
 ### 一次性验收服务 verify
 
-`verify` 是一次性服务：等待 API 健康后，在容器网络内对运行中的 API
+`verify` 是一次性服务：与 `api` 共用同一个镜像（镜像只在 `api` 上声明一次
+构建，`verify` 只引用镜像名、不重复构建，避免并行构建同名 tag 冲突），
+启动时先拉起 `api` 并等待其健康检查通过，然后在容器网络内对运行中的 API
 跑完整 pytest 套件（黑盒 HTTP），结束即退出。需显式启用 profile：
 
 ```bash
@@ -144,11 +151,12 @@ pytest
 
 ```
 app/
-  models.py      # Pydantic 模型与单条采样格式校验
+  models.py      # Pydantic 模型与单条采样取值校验
+  parsing.py     # 原始 JSON 解析：按字面量校验数字写法（两位小数 / 禁科学计数法）
   analysis.py    # 重排、整批校验、区段识别 / 合并 / 峰值选择
-  main.py        # FastAPI 路由与 422 异常处理
+  main.py        # FastAPI 路由、严格 JSON 路由类与 422 异常处理
 tests/
-  test_api.py    # 阈值、持续时长、合并 / 分开、乱序、拒绝边界等用例
-docker-compose.yml  # 仅 api 常驻；verify 为一次性验收服务（profile）
+  test_api.py    # 阈值、持续时长、合并 / 分开、乱序、拒绝边界、数字词法等用例
+docker-compose.yml  # 仅 api 常驻；verify 复用其镜像做一次性验收（profile）
 Dockerfile
 ```
