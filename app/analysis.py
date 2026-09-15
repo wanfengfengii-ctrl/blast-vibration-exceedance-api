@@ -65,19 +65,20 @@ def validate_series(points: list[Point]) -> None:
             )
 
 
-def _excess_dose_mm(points: list[Point], start_i: int, end_i: int) -> float:
+def _excess_dose_mm(points: list[Point], start_i: int, end_i: int) -> Decimal:
     """累计超限量：从事件首个超限采样到末个超限采样，逐秒累加
     max(振速 − 5.00, 0) × 1 秒。
 
     合并区段中夹着的低值采样经 max(·, 0) 后贡献为零；全程十进制定点
-    运算并保留两位小数，避免浮点累计漂移（如 0.10+0.20+0.30）。
+    运算并固定保留两位小数（如 0.60），避免浮点累计漂移
+    （如 0.10+0.20+0.30）与尾零丢失。
     """
     total = _DEC_ZERO
     for k in range(start_i, end_i + 1):
         # 振速已校验至多两位小数，格式化为两位即得精确十进制值
         vibration = Decimal(f"{points[k].vibration:.2f}")
         total += max(vibration - _DEC_THRESHOLD, _DEC_ZERO)  # × 1 秒
-    return float(total.quantize(_DEC_CENT))
+    return total.quantize(_DEC_CENT)
 
 
 def detect_events(points: list[Point], include_exposure: bool = False) -> list[Event]:

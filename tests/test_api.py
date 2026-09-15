@@ -357,7 +357,30 @@ def test_exposure_no_float_accumulation_drift(post):
     # 浮点累加 0.10+0.20+0.30 会得到 0.5999999999999996，定点运算必须为 0.60
     payload = seq([5.10, 5.20, 5.30])
     payload["include_exposure"] = True
-    assert post(payload).json()["events"][0]["excess_dose_mm"] == 0.6
+    resp = post(payload)
+    assert resp.json()["events"][0]["excess_dose_mm"] == 0.6
+    # 原始 JSON 文本固定两位小数，且是数字而非字符串
+    assert '"excess_dose_mm":0.60' in resp.text
+
+
+def test_exposure_rendered_as_number_with_two_decimal_places(post):
+    # 3.60 / 9.00 / 7.10 等尾零不得丢失；字段仍为 JSON 数字
+    cases = [
+        ([5.10, 6.20, 7.30, 5.00], "3.60"),
+        ([6.00, 6.00, 6.00, 4.99, 7.00, 7.00, 7.00], "9.00"),
+        ([5.00, 7.00, 5.10, 4.99, 6.20, 8.80, 5.00], "7.10"),
+        ([5.00, 5.00, 5.00], "0.00"),
+    ]
+    for values, expected in cases:
+        payload = seq(values)
+        payload["include_exposure"] = True
+        resp = post(payload)
+        assert resp.status_code == 200, values
+        assert f'"excess_dose_mm":{expected}' in resp.text, values
+        assert '"excess_dose_mm":"' not in resp.text  # 不得带引号退化为字符串
+        event = resp.json()["events"][0]
+        assert isinstance(event["excess_dose_mm"], (int, float))
+        assert event["excess_dose_mm"] == float(expected)
 
 
 def test_exposure_merged_event_with_one_low_gap_counts_only_overlimit(post):

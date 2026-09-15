@@ -2,6 +2,8 @@
 
 import re
 from datetime import datetime
+from decimal import Decimal
+from typing import Annotated
 
 from pydantic import (
     BaseModel,
@@ -10,6 +12,7 @@ from pydantic import (
     StrictBool,
     StrictFloat,
     StrictStr,
+    WithJsonSchema,
     field_validator,
 )
 
@@ -89,8 +92,10 @@ class Event(BaseModel):
     duration_seconds: int
     peak_vibration: float
     peak_timestamp: str
-    # 仅在请求 include_exposure=true 时填充；为 None 时响应中不输出该字段
-    excess_dose_mm: float | None = None
+    # 仅在请求 include_exposure=true 时填充；为 None 时响应中不输出该字段。
+    # 用 Decimal 承载定点两位小数（如 0.60），渲染层再还原为 JSON 数字字面量；
+    # Pydantic 默认把 Decimal 的 JSON Schema 标为 string，这里修正为 number。
+    excess_dose_mm: Annotated[Decimal, WithJsonSchema({"type": "number"})] | None = None
 
 
 class AnalyzeResponse(BaseModel):

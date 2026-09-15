@@ -1,6 +1,7 @@
 """FastAPI 应用：爆破振速持续超限复核。"""
 
 import json
+import re
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -43,6 +44,23 @@ def _validation_errors(exc: RequestValidationError) -> list[dict]:
         {"loc": list(err.get("loc", [])), "msg": err.get("msg"), "type": err.get("type")}
         for err in exc.errors()
     ]
+
+
+# excess_dose_mm 经 response_model 序列化后是两位小数字符串（"0.60"）
+_EXCESS_DOSE_RE = re.compile(r'"excess_dose_mm":"(-?\d+(?:\.\d+)?)"')
+
+
+class FixedDecimalJSONResponse(JSONResponse):
+    """把 excess_dose_mm 的定点小数字符串还原为 JSON 数字字面量。
+
+    Pydantic 将 Decimal 序列化为字符串 "0.60" 以保住两位小数；此处去掉
+    引号，使线上输出为固定两位小数的 JSON 数字 0.60（解析后仍是数值）。
+    仅作用于本路由的 200 响应体，键名唯一、取值已由模型校验，匹配安全。
+    """
+
+    def render(self, content) -> bytes:
+        text = super().render(content).decode("utf-8")
+        return _EXCESS_DOSE_RE.sub(r'"excess_dose_mm":\1', text).encode("utf-8")
 
 
 @app.exception_handler(BatchValidationError)
@@ -95,6 +113,8 @@ router = APIRouter(route_class=StrictJsonRoute)
     # include_exposure 缺省 / false 时 excess_dose_mm 为 None，
     # 序列化时剔除，保持原有响应结构不变
     response_model_exclude_none=True,
+    # excess_dose_mm 以固定两位小数的 JSON 数字输出
+    response_class=FixedDecimalJSONResponse,
 )
 async def analyze_samples(payload: AnalyzeRequest) -> AnalyzeResponse:
     # 字段结构 / 单条采样取值问题由 FastAPI/Pydantic 直接返回 422；
