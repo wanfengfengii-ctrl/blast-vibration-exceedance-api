@@ -6,6 +6,10 @@
 - **放行**：没有任何合格的持续超限事件（短暂尖峰不会误判为持续超限）；
 - **复核**：存在至少一个合格事件。
 
+复核员还可在请求中附带相邻测点的 `reference_samples`（参考采样批），
+服务将其与主批波形做时移对齐，在事件结论旁返回 `alignment`，
+帮助区分真实爆破波形与孤立干扰；省略时响应结构完全不变。
+
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · pytest。
 
 ## 判定口径
@@ -35,6 +39,32 @@
 6. 峰值取区间内最大振速；**并列时取最早出现的时刻**。
 
 事件按开始时间升序列出。
+
+### 波形对齐（可选，`reference_samples`）
+
+请求体附带 `reference_samples`（相邻测点的参考采样批）时，响应在事件结论旁
+附带 `alignment`。参考批与主批**沿用同一套重排、数字词法与整批校验**
+（重复时间戳、相邻 1 秒间隔）；批级错误按 `samples`、`reference_samples`
+的顺序报告（批内仍是重复先于间隔、同类取最早时间）。
+
+对齐算法：
+
+1. 将参考时间按 **-5 ~ +5 秒**逐个整数秒平移（`lag`），与主批取时间交集配对；
+2. 仅为**交集不少于 3 点**且**覆盖较短序列 80%** 的候选计算
+   **去均值归一化互相关**（全程十进制定点运算）；
+3. 任一侧交集波形方差为零（常量波形）的候选直接丢弃；
+4. 相关系数四舍五入至**六位小数**后比较，最高者胜出；
+   同分依次选择 **|lag| 较小**、**数值较小**的时移；
+5. 没有任何合格候选时整请求返回 `422` + `unalignable_series`，不输出部分结果。
+
+`alignment` 字段：
+
+- `lag_seconds`：使两批波形对齐的参考时间平移量（秒，正数表示参考波形出现得更早）；
+- `correlation`：去均值归一化互相关系数，**固定六位小数的 JSON 数字**（如 `1.000000`）；
+- `paired_sample_count`：参与相关计算的配对采样数。
+
+省略 `reference_samples`（或为 `null`）时响应不出现 `alignment`，
+其余结构完全不变；`include_exposure` 的行为不受参考批影响。
 
 ### 累计超限量（可选）
 
@@ -88,6 +118,50 @@
 
 其中 `excess_dose_mm` = (0.00+2.00+0.10) + 0.00（低值）+ (1.20+3.80+0.00) = 7.10 mm。
 
+附带参考批对齐的示例（参考批同一波形早 3 秒出现）：
+
+```json
+{
+  "samples": [
+    {"timestamp": "2026-09-15T10:00:00Z", "vibration": 0.5},
+    {"timestamp": "2026-09-15T10:00:01Z", "vibration": 1.2},
+    {"timestamp": "2026-09-15T10:00:02Z", "vibration": 8.6},
+    {"timestamp": "2026-09-15T10:00:03Z", "vibration": 6.1},
+    {"timestamp": "2026-09-15T10:00:04Z", "vibration": 5.2}
+  ],
+  "reference_samples": [
+    {"timestamp": "2026-09-15T09:59:57Z", "vibration": 0.5},
+    {"timestamp": "2026-09-15T09:59:58Z", "vibration": 1.2},
+    {"timestamp": "2026-09-15T09:59:59Z", "vibration": 8.6},
+    {"timestamp": "2026-09-15T10:00:00Z", "vibration": 6.1},
+    {"timestamp": "2026-09-15T10:00:01Z", "vibration": 5.2}
+  ]
+}
+```
+
+响应在事件结论旁给出对齐结果：
+
+```json
+{
+  "conclusion": "复核",
+  "event_count": 1,
+  "events": [
+    {
+      "start": "2026-09-15T10:00:02Z",
+      "end": "2026-09-15T10:00:04Z",
+      "duration_seconds": 3,
+      "peak_vibration": 8.6,
+      "peak_timestamp": "2026-09-15T10:00:02Z"
+    }
+  ],
+  "alignment": {
+    "lag_seconds": 3,
+    "correlation": 1.000000,
+    "paired_sample_count": 5
+  }
+}
+```
+
 无合格事件时：
 
 ```json
@@ -103,7 +177,9 @@
 其他错误码：`non_second_interval`（相邻间隔不为 1 秒）、
 `invalid_number_format`（数字写法不合法：超过两位小数、科学计数法、NaN/Infinity）、
 `invalid_json`（请求体不是合法 JSON）、
-`invalid_request`（字段缺失、时间戳格式、数值越界、类型不符等）。
+`invalid_request`（字段缺失、时间戳格式、数值越界、类型不符等）、
+`unalignable_series`（附带参考批时，两批在 ±5 秒时移内无可对齐区段：
+交集不足 3 点、覆盖不足较短序列 80%、或任一侧交集为常量波形）。
 
 另有 `GET /health` 存活探针，返回 `{"status":"ok"}`。服务启动后可访问
 `/docs` 查看交互式接口文档。
@@ -167,10 +243,12 @@ pytest
 app/
   models.py      # Pydantic 模型与单条采样取值校验
   parsing.py     # 原始 JSON 解析：按字面量校验数字写法（两位小数 / 禁科学计数法）
-  analysis.py    # 重排、整批校验、区段识别 / 合并 / 峰值选择、累计超限量（定点运算）
+  analysis.py    # 重排、整批校验、区段识别 / 合并 / 峰值选择、累计超限量、
+                 # 参考批波形对齐（±5 秒时移、去均值归一化互相关，定点运算）
   main.py        # FastAPI 路由、严格 JSON 路由类与 422 异常处理
 tests/
-  test_api.py    # 阈值、持续时长、合并 / 分开、乱序、拒绝边界、数字词法等用例
+  test_api.py    # 阈值、持续时长、合并 / 分开、乱序、拒绝边界、数字词法、
+                 # 参考批对齐（正负时移、覆盖下限、常量波形、同分决胜）等用例
 docker-compose.yml  # 仅 api 常驻；verify 复用其镜像做一次性验收（profile）
 Dockerfile
 ```

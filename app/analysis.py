@@ -2,12 +2,13 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from .models import (
     MERGE_GAP,
     MIN_RUN_LENGTH,
     VIBRATION_THRESHOLD,
+    Alignment,
     AnalyzeResponse,
     Event,
 )
@@ -19,9 +20,27 @@ _DEC_THRESHOLD = Decimal("5.00")
 _DEC_ZERO = Decimal("0")
 _DEC_CENT = Decimal("0.01")
 
+# 波形对齐：参考时间按 -5 ~ +5 秒逐个整数平移
+MAX_LAG_SECONDS = 5
+# 候选时移的交集下限：不少于 3 个配对采样，且覆盖较短序列的 80%（4/5）
+MIN_PAIRED_SAMPLES = 3
+_COVERAGE_NUM = 4
+_COVERAGE_DEN = 5
+# 互相关系数按十进制定点四舍五入至六位小数后比较、输出
+_CORR_QUANTUM = Decimal("0.000001")
+
 
 class BatchValidationError(ValueError):
     """整批采样不合法（重复时间戳 / 间隔不为 1 秒等），整批拒绝。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class AlignmentError(ValueError):
+    """主批与参考批在 ±5 秒时移内无可对齐区段，整请求拒绝。"""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -147,12 +166,90 @@ def detect_events(points: list[Point], include_exposure: bool = False) -> list[E
     return events
 
 
-def analyze(samples, include_exposure: bool = False) -> AnalyzeResponse:
+def _normalized_cross_correlation(pairs: list[tuple[float, float]]) -> Decimal | None:
+    """去均值归一化互相关：sum(x·y) / sqrt(sum(x²)·sum(y²))，x/y 均已去均值。
+
+    全程十进制定点运算（振速至多两位小数，均值与乘积在默认精度内精确），
+    结果四舍五入至六位小数。任一侧交集方差为零（常量波形）时返回 None。
+    """
+    xs = [Decimal(f"{x:.2f}") for x, _ in pairs]
+    ys = [Decimal(f"{y:.2f}") for _, y in pairs]
+    n = len(xs)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    dx = [x - mean_x for x in xs]
+    dy = [y - mean_y for y in ys]
+    sxx = sum(d * d for d in dx)
+    syy = sum(d * d for d in dy)
+    if sxx == 0 or syy == 0:
+        return None
+    sxy = sum(a * b for a, b in zip(dx, dy))
+    corr = sxy / (sxx * syy).sqrt()
+    quantized = corr.quantize(_CORR_QUANTUM, rounding=ROUND_HALF_UP)
+    # -0.000000 规范化为 0.000000，避免输出负零
+    return quantized if quantized != 0 else abs(quantized)
+
+
+def align_series(points: list[Point], ref_points: list[Point]) -> Alignment:
+    """把参考批时间按 -5 ~ +5 秒逐个整数平移，与主批取时间交集做波形对齐。
+
+    时移 lag 表示「参考时间 + lag 后与主批对齐」；候选须满足交集不少于
+    3 点、覆盖较短序列 80%、两侧交集方差均非零。相关系数经定点六位小数
+    舍入后比较，最高者胜出；同分依次取 |lag| 较小、数值较小的时移。
+    无任何合格候选时抛 AlignmentError（unalignable_series）。
+    """
+    ref_by_ts = {p.ts: p.vibration for p in ref_points}
+    shorter = min(len(points), len(ref_points))
+    best: tuple[Decimal, int, int] | None = None  # (correlation, lag, paired)
+    for lag in range(-MAX_LAG_SECONDS, MAX_LAG_SECONDS + 1):
+        shift = timedelta(seconds=lag)
+        pairs = [
+            (p.vibration, ref_by_ts[p.ts - shift])
+            for p in points
+            if p.ts - shift in ref_by_ts
+        ]
+        paired = len(pairs)
+        if paired < MIN_PAIRED_SAMPLES:
+            continue
+        # 覆盖较短序列 80%：paired / shorter >= 4/5，整数交叉相乘避免浮点
+        if paired * _COVERAGE_DEN < shorter * _COVERAGE_NUM:
+            continue
+        corr = _normalized_cross_correlation(pairs)
+        if corr is None:  # 任一侧常量波形，丢弃候选
+            continue
+        # 决胜键：系数高者优先，同分依次取 |lag| 小、lag 数值小
+        if best is None or (corr, -abs(lag), -lag) > (
+            best[0],
+            -abs(best[1]),
+            -best[1],
+        ):
+            best = (corr, lag, paired)
+    if best is None:
+        raise AlignmentError(
+            "unalignable_series",
+            "主批与参考批在 ±5 秒时移内无可对齐区段（交集不足或波形无变化）",
+        )
+    corr, lag, paired = best
+    return Alignment(
+        lag_seconds=lag, correlation=corr, paired_sample_count=paired
+    )
+
+
+def analyze(
+    samples, reference_samples=None, include_exposure: bool = False
+) -> AnalyzeResponse:
     points = _to_points(samples)
+    # 批级错误按 samples、reference_samples 的顺序报告
     validate_series(points)
+    ref_points = None
+    if reference_samples is not None:
+        ref_points = _to_points(reference_samples)
+        validate_series(ref_points)
     events = detect_events(points, include_exposure=include_exposure)
+    alignment = align_series(points, ref_points) if ref_points is not None else None
     return AnalyzeResponse(
         conclusion="复核" if events else "放行",
         event_count=len(events),
         events=events,
+        alignment=alignment,
     )

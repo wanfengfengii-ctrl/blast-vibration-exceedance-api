@@ -448,3 +448,256 @@ def test_non_boolean_exposure_flag_rejected_batch(post):
         body = resp.json()
         assert "events" not in body
         assert "conclusion" not in body
+
+
+# ---------- 参考批波形对齐 reference_samples / alignment ----------
+
+# 无周期性的类爆破波形：快速爬升后衰减，错位平移时不会意外高相关
+WAVE = [0.50, 1.20, 8.60, 6.10, 4.20, 2.80, 1.90, 1.10, 0.90, 0.60]
+
+
+def ref_seq(values, start: int = 0, shuffled: bool = False) -> list:
+    """生成参考批采样：从 BASE + start 秒起按秒递增；shuffled 模拟乱序。"""
+    items = [
+        {"timestamp": ts_at(start + i), "vibration": float(v)}
+        for i, v in enumerate(values)
+    ]
+    if shuffled:
+        items = items[::-1]
+        if len(items) > 3:
+            items[0], items[1] = items[1], items[0]
+    return items
+
+
+def test_alignment_positive_lag(post):
+    # 参考批同一波形早 3 秒出现：参考时间 +3 秒后与主批完全对齐
+    payload = seq(WAVE)
+    payload["reference_samples"] = ref_seq(WAVE, start=-3)
+    resp = post(payload)
+    assert resp.status_code == 200
+    alignment = resp.json()["alignment"]
+    assert alignment["lag_seconds"] == 3
+    assert alignment["correlation"] == 1.0
+    assert alignment["paired_sample_count"] == 10
+    # 定点六位小数的 JSON 数字，而非字符串
+    assert '"correlation":1.000000' in resp.text
+
+
+def test_alignment_negative_lag(post):
+    # 参考批同一波形晚 2 秒出现：参考时间 -2 秒后对齐
+    payload = seq(WAVE)
+    payload["reference_samples"] = ref_seq(WAVE, start=2)
+    resp = post(payload)
+    assert resp.status_code == 200
+    alignment = resp.json()["alignment"]
+    assert alignment["lag_seconds"] == -2
+    assert alignment["correlation"] == 1.0
+    assert alignment["paired_sample_count"] == 10
+
+
+def test_alignment_deterministic_with_shuffled_input(post):
+    # 两批均乱序提交，重排后结果与顺序提交一致
+    shuffled = seq(WAVE, shuffled=True)
+    shuffled["reference_samples"] = ref_seq(WAVE, start=-3, shuffled=True)
+    ordered = seq(WAVE)
+    ordered["reference_samples"] = ref_seq(WAVE, start=-3)
+    assert post(shuffled).json()["alignment"] == post(ordered).json()["alignment"]
+
+
+def test_alignment_omitted_or_null_leaves_response_unchanged(post):
+    # 省略 reference_samples：不出现 alignment，结构与旧契约一致
+    body = post(seq(WAVE)).json()
+    assert set(body) == {"conclusion", "event_count", "events"}
+    # 显式 null 视同省略
+    payload = seq(WAVE)
+    payload["reference_samples"] = None
+    assert "alignment" not in post(payload).json()
+
+
+def test_alignment_unalignable_when_no_overlap(post):
+    # 参考批在 ±5 秒时移内与主批毫无交集
+    payload = seq(WAVE)
+    payload["reference_samples"] = ref_seq(WAVE, start=20)
+    resp = post(payload)
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["code"] == "unalignable_series"
+    # 不输出任何部分结果
+    assert "events" not in body
+    assert "conclusion" not in body
+    assert "alignment" not in body
+
+
+def test_alignment_unalignable_when_overlap_below_80_percent(post):
+    # 错位 8 秒：最大交集（lag=-5）为 7 点，不足较短序列 10 点的 80%
+    payload = seq(WAVE)
+    payload["reference_samples"] = ref_seq(WAVE, start=8)
+    resp = post(payload)
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "unalignable_series"
+
+
+def test_alignment_exactly_80_percent_coverage_accepted(post):
+    # 交集 8 点恰好覆盖较短序列 10 点的 80%：达标，lag=0 完全线性相关胜出
+    payload = seq(WAVE)
+    # 参考批 t=2..11：前 8 点为主批同时刻的线性变换 y=2x+1，末 2 点无关
+    payload["reference_samples"] = ref_seq(
+        [18.20, 13.20, 9.40, 6.60, 4.80, 3.20, 2.80, 2.20, 0.50, 0.60], start=2
+    )
+    resp = post(payload)
+    assert resp.status_code == 200
+    alignment = resp.json()["alignment"]
+    assert alignment["lag_seconds"] == 0
+    assert alignment["correlation"] == 1.0
+    assert alignment["paired_sample_count"] == 8
+
+
+def test_alignment_unalignable_when_intersection_too_small(post):
+    # 错位 9 秒：lag=-5 时交集仅 1 点，不足 3 点下限
+    payload = seq(WAVE[:5])
+    payload["reference_samples"] = ref_seq(WAVE[:5], start=9)
+    resp = post(payload)
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "unalignable_series"
+
+
+def test_alignment_constant_waveform_rejected(post):
+    # 主批常量：交集方差为零，所有候选被丢弃
+    payload = seq([5.00, 5.00, 5.00, 5.00, 5.00])
+    payload["reference_samples"] = ref_seq([1.00, 2.00, 3.00, 4.00, 5.00])
+    resp = post(payload)
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "unalignable_series"
+    # 参考批常量亦然
+    payload = seq([1.00, 2.00, 3.00, 4.00, 5.00])
+    payload["reference_samples"] = ref_seq([5.00, 5.00, 5.00, 5.00, 5.00])
+    resp = post(payload)
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "unalignable_series"
+
+
+def test_alignment_tie_prefers_smaller_absolute_lag(post):
+    # 主批等差序列、参考批为其线性变换且晚 2 秒：
+    # lag=-2（9 对）与 lag=-1（8 对）的相关系数均为 1.000000，
+    # 同分时 |lag| 较小者胜出
+    payload = seq([1, 2, 3, 4, 5, 6, 7, 8, 9])
+    payload["reference_samples"] = ref_seq(
+        [3, 5, 7, 9, 11, 13, 15, 17, 19], start=2
+    )
+    alignment = post(payload).json()["alignment"]
+    assert alignment["lag_seconds"] == -1
+    assert alignment["correlation"] == 1.0
+    assert alignment["paired_sample_count"] == 8
+
+
+def test_alignment_tie_prefers_smaller_lag_value(post):
+    # 周期 2 波形：lag=-1 与 lag=+1 相关系数同为 1.000000、|lag| 相同，
+    # 数值较小的时移胜出
+    payload = seq([3, 7, 3, 7, 3, 7, 3, 7, 3, 7])
+    payload["reference_samples"] = ref_seq([15, 7, 15, 7, 15, 7, 15, 7, 15, 7])
+    alignment = post(payload).json()["alignment"]
+    assert alignment["lag_seconds"] == -1
+    assert alignment["correlation"] == 1.0
+    assert alignment["paired_sample_count"] == 9
+
+
+def test_alignment_correlation_rounded_to_six_decimal_places(post):
+    # corr = 1/sqrt(4/3) ≈ 0.8660254，定点四舍五入至六位小数
+    payload = seq([1.00, 2.00, 3.00])
+    payload["reference_samples"] = ref_seq([1.00, 1.00, 2.00])
+    resp = post(payload)
+    assert resp.status_code == 200
+    alignment = resp.json()["alignment"]
+    assert alignment["lag_seconds"] == 0
+    assert alignment["paired_sample_count"] == 3
+    assert alignment["correlation"] == 0.866025
+    assert '"correlation":0.866025' in resp.text
+    assert '"correlation":"' not in resp.text  # 不得带引号退化为字符串
+
+
+def test_alignment_negative_correlation_rendered(post):
+    # 完全负相关：-1.000000 同样以六位小数 JSON 数字输出
+    payload = seq([1.00, 2.00, 3.00, 4.00, 5.00])
+    payload["reference_samples"] = ref_seq([5.00, 4.00, 3.00, 2.00, 1.00])
+    resp = post(payload)
+    assert resp.status_code == 200
+    alignment = resp.json()["alignment"]
+    assert alignment["correlation"] == -1.0
+    assert '"correlation":-1.000000' in resp.text
+
+
+def test_alignment_does_not_change_events_or_exposure(post):
+    # 附带参考批时，事件边界、累计超限量与原响应结构均保持不变
+    values = [6.00, 6.00, 6.00, 4.99, 7.00, 7.00, 7.00]
+    legacy = post(dict(seq(values), include_exposure=True)).json()
+    with_ref = dict(seq(values), include_exposure=True)
+    with_ref["reference_samples"] = ref_seq(WAVE[:7], start=-2)
+    resp = post(with_ref)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["conclusion"] == legacy["conclusion"]
+    assert body["event_count"] == legacy["event_count"]
+    assert body["events"] == legacy["events"]  # 含 excess_dose_mm
+    assert set(body["alignment"]) == {
+        "lag_seconds", "correlation", "paired_sample_count",
+    }
+    assert -5 <= body["alignment"]["lag_seconds"] <= 5
+
+
+# ---------- 参考批自身的整批校验 ----------
+
+def test_reference_duplicate_timestamp_rejected(post):
+    payload = seq([1.0, 1.0, 1.0])
+    ref = ref_seq([1.0, 1.0, 1.0])
+    ref[2]["timestamp"] = ts_at(1)  # 参考批内重复
+    payload["reference_samples"] = ref
+    resp = post(payload)
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "duplicate_timestamp"
+
+
+def test_reference_non_second_interval_rejected(post):
+    payload = seq([1.0, 1.0, 1.0])
+    ref = ref_seq([1.0, 1.0, 1.0])
+    ref[2]["timestamp"] = ts_at(5)  # 0,1,5 -> 间隔不为 1 秒
+    payload["reference_samples"] = ref
+    resp = post(payload)
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "non_second_interval"
+
+
+def test_primary_batch_error_reported_before_reference(post):
+    # 主批重复、参考批间隔错误：批级错误按 samples、reference_samples 顺序报告
+    payload = seq([1.0, 1.0, 1.0])
+    payload["samples"][2]["timestamp"] = ts_at(0)  # 主批重复
+    ref = ref_seq([1.0, 1.0, 1.0])
+    ref[2]["timestamp"] = ts_at(5)  # 参考批间隔错误
+    payload["reference_samples"] = ref
+    resp = post(payload)
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "duplicate_timestamp"
+
+
+def test_reference_number_lexical_rules_enforced(post_raw):
+    # 参考批沿用同一套数字词法：三位小数 / 科学计数法同样拒绝
+    for bad in ("5.000", "5e0"):
+        raw = (
+            '{"samples":[{"timestamp":"%s","vibration":1.0}],'
+            '"reference_samples":[{"timestamp":"%s","vibration":%s}]}'
+            % (ts_at(0), ts_at(0), bad)
+        )
+        resp = post_raw(raw)
+        assert resp.status_code == 422, bad
+        assert resp.json()["code"] == "invalid_number_format"
+
+
+def test_reference_sample_value_range_enforced(post):
+    payload = seq([1.0])
+    payload["reference_samples"] = [{"timestamp": ts_at(0), "vibration": 200.01}]
+    assert post(payload).status_code == 422
+
+
+def test_reference_empty_batch_rejected(post):
+    payload = seq([1.0])
+    payload["reference_samples"] = []
+    assert post(payload).status_code == 422

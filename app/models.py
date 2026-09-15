@@ -73,11 +73,16 @@ class Sample(BaseModel):
 
 
 class AnalyzeRequest(BaseModel):
-    """一次请求提交同一测点的一批采样。"""
+    """一次请求提交同一测点的一批采样，可附带相邻测点的参考采样批。"""
 
     model_config = ConfigDict(extra="forbid")
 
     samples: list[Sample] = Field(..., min_length=1)
+    reference_samples: list[Sample] | None = Field(
+        None,
+        min_length=1,
+        description="相邻测点的参考采样批；提供时响应附带波形对齐结果 alignment，省略时响应结构不变",
+    )
     include_exposure: StrictBool = Field(
         False,
         description="为 true 时每个事件附带累计超限量 excess_dose_mm；省略或 false 时响应结构不变",
@@ -98,14 +103,31 @@ class Event(BaseModel):
     excess_dose_mm: Annotated[Decimal, WithJsonSchema({"type": "number"})] | None = None
 
 
+class Alignment(BaseModel):
+    """主批与参考批的波形对齐结果。
+
+    lag_seconds：使两批波形对齐的参考时间平移量（秒，-5 ~ 5）；
+    correlation：去均值归一化互相关系数，定点六位小数，
+    渲染层还原为 JSON 数字字面量（同 excess_dose_mm 的处理）；
+    paired_sample_count：参与相关计算的配对采样数。
+    """
+
+    lag_seconds: int
+    correlation: Annotated[Decimal, WithJsonSchema({"type": "number"})]
+    paired_sample_count: int
+
+
 class AnalyzeResponse(BaseModel):
     """分析结果。
 
     conclusion 取值：
     - "放行"：没有任何合格超限事件
     - "复核"：存在至少一个合格超限事件
+
+    alignment 仅在请求附带 reference_samples 时填充；为 None 时响应中不输出。
     """
 
     conclusion: str
     event_count: int
     events: list[Event]
+    alignment: Alignment | None = None

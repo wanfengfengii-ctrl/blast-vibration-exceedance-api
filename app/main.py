@@ -8,7 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
-from .analysis import BatchValidationError, analyze
+from .analysis import AlignmentError, BatchValidationError, analyze
 from .models import AnalyzeRequest, AnalyzeResponse
 from .parsing import MalformedPayloadError, parse_json_payload
 
@@ -48,19 +48,23 @@ def _validation_errors(exc: RequestValidationError) -> list[dict]:
 
 # excess_dose_mm 经 response_model 序列化后是两位小数字符串（"0.60"）
 _EXCESS_DOSE_RE = re.compile(r'"excess_dose_mm":"(-?\d+(?:\.\d+)?)"')
+# correlation 同理，是六位小数字符串（"0.866025"）
+_CORRELATION_RE = re.compile(r'"correlation":"(-?\d+(?:\.\d+)?)"')
 
 
 class FixedDecimalJSONResponse(JSONResponse):
-    """把 excess_dose_mm 的定点小数字符串还原为 JSON 数字字面量。
+    """把定点小数字符串还原为 JSON 数字字面量。
 
-    Pydantic 将 Decimal 序列化为字符串 "0.60" 以保住两位小数；此处去掉
-    引号，使线上输出为固定两位小数的 JSON 数字 0.60（解析后仍是数值）。
-    仅作用于本路由的 200 响应体，键名唯一、取值已由模型校验，匹配安全。
+    Pydantic 将 Decimal 序列化为字符串以保住定点精度；此处去掉引号，
+    使 excess_dose_mm 输出为固定两位小数、correlation 输出为固定六位
+    小数的 JSON 数字（解析后仍是数值）。仅作用于本路由的 200 响应体，
+    键名唯一、取值已由模型校验，匹配安全。
     """
 
     def render(self, content) -> bytes:
         text = super().render(content).decode("utf-8")
-        return _EXCESS_DOSE_RE.sub(r'"excess_dose_mm":\1', text).encode("utf-8")
+        text = _EXCESS_DOSE_RE.sub(r'"excess_dose_mm":\1', text)
+        return _CORRELATION_RE.sub(r'"correlation":\1', text).encode("utf-8")
 
 
 @app.exception_handler(BatchValidationError)
@@ -68,6 +72,17 @@ async def batch_validation_exception_handler(
     _request: Request, exc: BatchValidationError
 ) -> JSONResponse:
     # 整批不合法：422 且不输出任何部分结果
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.message, "code": exc.code},
+    )
+
+
+@app.exception_handler(AlignmentError)
+async def alignment_exception_handler(
+    _request: Request, exc: AlignmentError
+) -> JSONResponse:
+    # 主批与参考批无法对齐：422 且不输出任何部分结果
     return JSONResponse(
         status_code=422,
         content={"detail": exc.message, "code": exc.code},
@@ -118,8 +133,13 @@ router = APIRouter(route_class=StrictJsonRoute)
 )
 async def analyze_samples(payload: AnalyzeRequest) -> AnalyzeResponse:
     # 字段结构 / 单条采样取值问题由 FastAPI/Pydantic 直接返回 422；
-    # 重复时间戳、间隔不为 1 秒等整批级错误由 BatchValidationError 转 422。
-    return analyze(payload.samples, include_exposure=payload.include_exposure)
+    # 重复时间戳、间隔不为 1 秒等整批级错误由 BatchValidationError 转 422；
+    # 主批与参考批无法对齐由 AlignmentError 转 422。
+    return analyze(
+        payload.samples,
+        reference_samples=payload.reference_samples,
+        include_exposure=payload.include_exposure,
+    )
 
 
 app.include_router(router)
